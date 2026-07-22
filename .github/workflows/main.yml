@@ -1,0 +1,137 @@
+# =============================================================================
+# Supabase logical backup → Cloudflare R2  (PRODUCTION)
+# -----------------------------------------------------------------------------
+# → Commit this file to the BACKUP REPO (private) at:  .github/workflows/backup.yml
+#
+# Every 2h: pg_dump (parallel, zstd) + roles → tar → upload to R2.
+# Retention is handled by R2 Object Lifecycle Rules (NOT this workflow):
+#   - prefix hourly/ : delete after 1 day (24h) → ~12 copies at steady state
+#   - prefix daily/  : delete after 14 days     → the 00:00 UTC run is also copied here
+#   Steady-state storage ≈ 10 GB → fits R2's 10 GB-month free tier (~$0/mo).
+# Reliability: concurrency lock, timeout guard, dead-man's-switch heartbeat.
+#
+# Validated config (test runs 2026-07-21): --jobs=2 --format=directory
+# --compress=zstd:3 → ~4m42s, ~390MB, server PostgreSQL 17.6, session pooler 5432.
+#
+# ---- Secrets required (repo → Settings → Secrets and variables → Actions) ----
+#   SUPABASE_DB_URL      session pooler string, port 5432 (NOT 6543, NOT direct)
+#   R2_ACCOUNT_ID        Cloudflare account id
+#   R2_ACCESS_KEY_ID     R2 API token (scoped to the backup bucket, Object R/W)
+#   R2_SECRET_ACCESS_KEY R2 API token secret
+#   R2_BUCKET            e.g. supabase-backups
+#   HEALTHCHECK_URL      (recommended) dead-man's-switch ping URL, e.g. Healthchecks.io
+# =============================================================================
+
+name: supabase-backup
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # every 2 hours, on the hour (UTC)
+  workflow_dispatch:         # manual trigger for on-demand backups / testing
+
+permissions:
+  contents: read
+
+# Never let two backups overlap; if one overruns, the next waits then the
+# older PENDING one is skipped (missed slot dropped, never piled up).
+concurrency:
+  group: supabase-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20   # measured dump ~5 min; fail fast if it hangs
+
+    steps:
+      # ---- 1. pg_dump 17 client (force ahead of the runner's pre-installed v16)
+      - name: Install postgresql-client 17 (PGDG)
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      # ---- 2. Dump: data (parallel dir) + roles (companion), then tar --------
+      - name: pg_dump (data + roles)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d_%H%M)
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          mkdir -p /tmp/backup
+
+          # 2a. Data — parallel, directory format, zstd:3
+          pg_dump "$SUPABASE_DB_URL" \
+            --format=directory --jobs=2 --compress=zstd:3 \
+            --no-owner --no-privileges \
+            --file=/tmp/backup/data
+
+          # 2b. Roles/grants companion (definitions only; passwords excluded for
+          #     security — document manual reset in the restore runbook).
+          pg_dumpall "$SUPABASE_DB_URL" --roles-only --no-role-passwords \
+            > /tmp/backup/roles.sql
+
+          # 2c. Single artifact
+          tar -cf "/tmp/bbf_${STAMP}.tar" -C /tmp backup
+          echo "Artifact: $(du -h /tmp/bbf_${STAMP}.tar | cut -f1)"
+
+      # ---- 3. Upload to R2 (aws-cli is preinstalled on ubuntu runners) -------
+      - name: Upload to Cloudflare R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          FILE="/tmp/bbf_${STAMP}.tar"
+
+          # Always land in hourly/ (retention: R2 lifecycle deletes >24h).
+          aws s3 cp "$FILE" "s3://${R2_BUCKET}/hourly/bbf_${STAMP}.tar" \
+            --endpoint-url "$ENDPOINT" --only-show-errors
+          echo "Uploaded hourly/bbf_${STAMP}.tar"
+
+          # The 00:00 UTC run is also kept as a 14-day daily rollup.
+          # Key the daily copy off the STAMP's hour (the dump's own slot), NOT the
+          # upload-time clock — otherwise a run crossing an hour boundary could
+          # double-copy or miss the daily rollup. STAMP=YYYYMMDD_HHMM → chars 9-10 = HH.
+          if [ "${STAMP:9:2}" = "00" ]; then
+            aws s3 cp "$FILE" "s3://${R2_BUCKET}/daily/bbf_${STAMP}.tar" \
+              --endpoint-url "$ENDPOINT" --only-show-errors
+            echo "Also uploaded daily/bbf_${STAMP}.tar"
+          fi
+
+      # ---- 4. Dead-man's-switch: signal SUCCESS (only if this step is reached)
+      - name: Heartbeat ping (success)
+        if: success()
+        env:
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        run: |
+          if [ -n "${HEALTHCHECK_URL:-}" ]; then
+            curl -fsS -m 10 --retry 3 "$HEALTHCHECK_URL" || true
+          fi
+
+      # ---- 5. On failure: signal the monitor (catches run-level errors) ------
+      - name: Heartbeat ping (failure)
+        if: failure()
+        env:
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+        run: |
+          if [ -n "${HEALTHCHECK_URL:-}" ]; then
+            curl -fsS -m 10 --retry 3 "${HEALTHCHECK_URL}/fail" || true
+          fi
+
+      # ---- 6. Always wipe temp files off the runner --------------------------
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/backup /tmp/bbf_*.tar || true
