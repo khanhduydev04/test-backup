@@ -76,7 +76,7 @@ jobs:
 
           # 2b. Roles/grants companion (definitions only; passwords excluded for
           #     security — document manual reset in the restore runbook).
-          pg_dumpall "$SUPABASE_DB_URL" --roles-only --no-role-passwords \
+          pg_dumpall -d "$SUPABASE_DB_URL" --roles-only --no-role-passwords \
             > /tmp/backup/roles.sql
 
           # 2c. Single artifact
