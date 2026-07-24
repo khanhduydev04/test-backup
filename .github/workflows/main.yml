@@ -101,14 +101,16 @@ jobs:
             --endpoint-url "$ENDPOINT" --only-show-errors
           echo "Uploaded hourly/bbf_${STAMP}.tar"
 
-          # The 00:00 UTC run is also kept as a 14-day daily rollup.
-          # Key the daily copy off the STAMP's hour (the dump's own slot), NOT the
-          # upload-time clock — otherwise a run crossing an hour boundary could
-          # double-copy or miss the daily rollup. STAMP=YYYYMMDD_HHMM → chars 9-10 = HH.
-          if [ "${STAMP:9:2}" = "00" ]; then
+          # The FIRST successful run of each UTC day is also kept as a 14-day daily
+          # rollup. Keyed off "does today's daily already exist?" — deliberately NOT
+          # off a fixed hour: GitHub cron drifts up to ~90 min and skips slots.
+          DAY="${STAMP:0:8}"
+          EXISTING=$(aws s3 ls "s3://${R2_BUCKET}/daily/bbf_${DAY}_" \
+            --endpoint-url "$ENDPOINT" 2>/dev/null || true)
+          if [ -z "$EXISTING" ]; then
             aws s3 cp "$FILE" "s3://${R2_BUCKET}/daily/bbf_${STAMP}.tar" \
               --endpoint-url "$ENDPOINT" --only-show-errors
-            echo "Also uploaded daily/bbf_${STAMP}.tar"
+            echo "Also uploaded daily/bbf_${STAMP}.tar (first run of ${DAY} UTC)"
           fi
 
       # ---- 4. Dead-man's-switch: signal SUCCESS (only if this step is reached)
