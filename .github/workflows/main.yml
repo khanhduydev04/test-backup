@@ -3,11 +3,15 @@
 # -----------------------------------------------------------------------------
 # → Commit this file to the BACKUP REPO (private) at:  .github/workflows/backup.yml
 #
-# Every 2h: pg_dump (parallel, zstd) + roles → tar → upload to R2.
+# Exactly ONE successful backup per UTC day, stored in R2 daily/.
+#   - The workflow is scheduled 4× a day (20:17–23:17 UTC) as RETRY slots.
+#   - Each run first checks R2 for today's daily/bbf_<YYYYMMDD>_* object:
+#       exists  → skip everything (green no-op)
+#       missing → pg_dump + upload
+#     So the first success wins; a failed/dropped slot is retried by the next one.
 # Retention is handled by R2 Object Lifecycle Rules (NOT this workflow):
-#   - prefix hourly/ : delete after 1 day (24h) → ~12 copies at steady state
-#   - prefix daily/  : delete after 14 days     → the 00:00 UTC run is also copied here
-#   Steady-state storage ≈ 10 GB → fits R2's 10 GB-month free tier (~$0/mo).
+#   - prefix daily/ : delete after 14 days → ~14 copies at steady state
+#   Steady-state storage ≈ 14 × ~390 MB ≈ 5.5 GB → fits R2's 10 GB-month free tier.
 # Reliability: concurrency lock, timeout guard, dead-man's-switch heartbeat.
 #
 # Validated config (test runs 2026-07-21): --jobs=2 --format=directory
@@ -26,14 +30,19 @@ name: supabase-backup
 
 on:
   schedule:
-    - cron: "25 */2 * * *"   # every 2 hours, on the hour (UTC)
-  workflow_dispatch:         # manual trigger for on-demand backups / testing
+    - cron: "17 20-23 * * *"   # 20:17, 21:17, 22:17, 23:17 UTC (= 03:17–06:17 ICT); retry slots, same UTC day
+  workflow_dispatch:           # manual trigger; still skips if today's backup exists unless force=true
+    inputs:
+      force:
+        description: "Backup even if today's daily backup already exists"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-# Never let two backups overlap; if one overruns, the next waits then the
-# older PENDING one is skipped (missed slot dropped, never piled up).
+# Never let two backups overlap; runs queue behind each other, so the
+# existence check below always sees the previous run's upload.
 concurrency:
   group: supabase-backup
   cancel-in-progress: false
@@ -43,9 +52,50 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20   # measured dump ~5 min; fail fast if it hangs
 
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
     steps:
+      # ---- 0. Already have today's backup? Then do nothing -------------------
+      #      Deliberately NO "|| true": if R2 is unreachable / creds are wrong,
+      #      fail loudly instead of mistaking it for "no backup yet".
+      - name: Check today's backup in R2
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y%m%d_%H%M)
+          DAY="${STAMP:0:8}"
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "force=true → backing up regardless"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          COUNT=$(aws s3api list-objects-v2 \
+            --bucket "$R2_BUCKET" --prefix "daily/bbf_${DAY}_" --max-keys 1 \
+            --query 'length(Contents || `[]`)' --output text \
+            --endpoint-url "$ENDPOINT")
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "daily/bbf_${DAY}_* already exists → skip (1 backup/day)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No backup for ${DAY} yet → proceeding"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # ---- 1. pg_dump 17 client (force ahead of the runner's pre-installed v16)
       - name: Install postgresql-client 17 (PGDG)
+        if: steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -60,12 +110,11 @@ jobs:
 
       # ---- 2. Dump: data (parallel dir) + roles (companion), then tar --------
       - name: pg_dump (data + roles)
+        if: steps.check.outputs.skip != 'true'
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           set -euo pipefail
-          STAMP=$(date -u +%Y%m%d_%H%M)
-          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
           mkdir -p /tmp/backup
 
           # 2a. Data — parallel, directory format, zstd:3
@@ -83,37 +132,21 @@ jobs:
           tar -cf "/tmp/bbf_${STAMP}.tar" -C /tmp backup
           echo "Artifact: $(du -h /tmp/bbf_${STAMP}.tar | cut -f1)"
 
-      # ---- 3. Upload to R2 (aws-cli is preinstalled on ubuntu runners) -------
+      # ---- 3. Upload to R2 daily/ (aws-cli is preinstalled on ubuntu runners)
       - name: Upload to Cloudflare R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        if: steps.check.outputs.skip != 'true'
         run: |
           set -euo pipefail
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          FILE="/tmp/bbf_${STAMP}.tar"
 
-          # Always land in hourly/ (retention: R2 lifecycle deletes >24h).
-          aws s3 cp "$FILE" "s3://${R2_BUCKET}/hourly/bbf_${STAMP}.tar" \
+          # Retention: R2 lifecycle rule deletes daily/ objects older than 14 days.
+          # The object only appears once the multipart upload completes, so a
+          # half-uploaded file never counts as "today's backup" for the check above.
+          aws s3 cp "/tmp/bbf_${STAMP}.tar" "s3://${R2_BUCKET}/daily/bbf_${STAMP}.tar" \
             --endpoint-url "$ENDPOINT" --only-show-errors
-          echo "Uploaded hourly/bbf_${STAMP}.tar"
+          echo "Uploaded daily/bbf_${STAMP}.tar"
 
-          # The FIRST successful run of each UTC day is also kept as a 14-day daily
-          # rollup. Keyed off "does today's daily already exist?" — deliberately NOT
-          # off a fixed hour: GitHub cron drifts up to ~90 min and skips slots.
-          DAY="${STAMP:0:8}"
-          EXISTING=$(aws s3 ls "s3://${R2_BUCKET}/daily/bbf_${DAY}_" \
-            --endpoint-url "$ENDPOINT" 2>/dev/null || true)
-          if [ -z "$EXISTING" ]; then
-            aws s3 cp "$FILE" "s3://${R2_BUCKET}/daily/bbf_${STAMP}.tar" \
-              --endpoint-url "$ENDPOINT" --only-show-errors
-            echo "Also uploaded daily/bbf_${STAMP}.tar (first run of ${DAY} UTC)"
-          fi
-
-      # ---- 4. Dead-man's-switch: signal SUCCESS (only if this step is reached)
+      # ---- 4. Dead-man's-switch: signal SUCCESS (also on skip: day is covered)
       - name: Heartbeat ping (success)
         if: success()
         env:
@@ -123,7 +156,7 @@ jobs:
             curl -fsS -m 10 --retry 3 "$HEALTHCHECK_URL" || true
           fi
 
-      # ---- 5. On failure: signal the monitor (catches run-level errors) ------
+      # ---- 5. On failure: signal the monitor (next retry slot may still fix it)
       - name: Heartbeat ping (failure)
         if: failure()
         env:
